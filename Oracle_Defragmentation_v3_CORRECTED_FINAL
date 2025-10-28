@@ -1,0 +1,909 @@
+-- ================================================================================
+-- Oracle 19c+ Tablespace Defragmentation Script v3 - CORRECTED FINAL
+-- ================================================================================
+-- Purpose: Defragment tablespace with LOB and PARTITION support
+-- Method:  SOURCE → SOURCE_SHRINK → SOURCE (2-tablespace method)
+-- Version: 3.0 CORRECTED - All critical fixes applied
+-- ================================================================================
+-- CRITICAL FIX #1: Prevent SQL*Plus substitution variable interpretation
+-- ================================================================================
+
+SET DEFINE on 
+SET ECHO OFF
+SET FEEDBACK OFF
+SET VERIFY OFF
+SET SERVEROUTPUT ON SIZE UNLIMITED
+SET LINESIZE 200
+SET PAGESIZE 1000
+
+-- ================================================================================
+-- INPUT PARAMETERS
+-- ================================================================================
+
+ACCEPT v_source_tablespace CHAR PROMPT 'Enter Source Tablespace Name: '
+ACCEPT v_objects_per_batch NUMBER DEFAULT 5 PROMPT 'Enter Objects per Batch (default 5): '
+ACCEPT v_lob_objects_per_batch NUMBER DEFAULT 2 PROMPT 'Enter LOB Objects per Batch (default 2): '
+ACCEPT v_buffer_gb NUMBER DEFAULT 10 PROMPT 'Enter Buffer Size in GB (default 10): '
+ACCEPT v_partition_max_count NUMBER DEFAULT 20 PROMPT 'Max Partitions for Online REDEF (default 20): '
+ACCEPT v_partition_max_size_gb NUMBER DEFAULT 100 PROMPT 'Max Size GB for Online REDEF (default 100): '
+ACCEPT v_dry_run CHAR DEFAULT 'Y' PROMPT 'Dry Run Mode? (Y/N, default Y): '
+
+PROMPT
+PROMPT ================================================================================
+PROMPT DEFRAGMENTATION SCRIPT v3 - LOB AND PARTITION SUPPORT
+PROMPT ================================================================================
+PROMPT Source Tablespace:           &v_source_tablespace
+PROMPT Objects per Batch:                    &v_objects_per_batch
+PROMPT LOB Objects per Batch:                &v_lob_objects_per_batch
+PROMPT Buffer Size:                         &v_buffer_gb GB
+PROMPT Partition REDEF Max Count:           &v_partition_max_count
+PROMPT Partition REDEF Max Size:           &v_partition_max_size_gb
+PROMPT Mode:                        &v_dry_run
+PROMPT ================================================================================
+
+DECLARE
+    -- Main variables
+    v_source_tablespace VARCHAR2(128) := UPPER('&v_source_tablespace');
+    v_objects_per_batch NUMBER := &v_objects_per_batch;
+    v_lob_objects_per_batch NUMBER := &v_lob_objects_per_batch;
+    v_buffer_gb NUMBER := &v_buffer_gb;
+    v_buffer_mb NUMBER := v_buffer_gb * 1024;
+    v_partition_max_count NUMBER := &v_partition_max_count;
+    v_partition_max_size_gb NUMBER := &v_partition_max_size_gb;
+    v_dry_run VARCHAR2(1) := UPPER('&v_dry_run');
+    
+    -- Tablespace variables
+    v_shrink_tablespace VARCHAR2(128);
+    v_source_size_mb NUMBER;
+    v_source_used_mb NUMBER;
+    v_shrink_size_mb NUMBER;
+    v_shrink_exists NUMBER;
+    v_new_source_size_mb NUMBER;
+    
+    -- Counters
+    v_total_tables NUMBER := 0;
+    v_total_indexes NUMBER := 0;
+    v_total_lob_tables NUMBER := 0;
+    v_tables_moved NUMBER := 0;
+    v_indexes_moved NUMBER := 0;
+    v_lob_tables_moved NUMBER := 0;
+    
+    -- Working variables
+    v_sql VARCHAR2(4000);
+    v_bigfile VARCHAR2(3);
+    v_block_size NUMBER;
+    
+    -- Timing
+    v_phase_start_time TIMESTAMP;
+    v_phase_duration NUMBER;
+    v_script_start_time TIMESTAMP := SYSTIMESTAMP;
+    
+    -- Resource tracking
+    v_undo_tablespace VARCHAR2(128);
+    v_required_undo_gb NUMBER;
+    v_available_undo_gb NUMBER;
+    
+BEGIN
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('================================================================================');
+    DBMS_OUTPUT.PUT_LINE('PHASE 1: PRE-FLIGHT CHECKS');
+    DBMS_OUTPUT.PUT_LINE('================================================================================');
+    v_phase_start_time := SYSTIMESTAMP;
+    
+    -- ============================================================================
+    -- 1. Verify source tablespace exists
+    -- ============================================================================
+    BEGIN
+        SELECT bigfile, block_size
+        INTO v_bigfile, v_block_size
+        FROM dba_tablespaces
+        WHERE tablespace_name = v_source_tablespace;
+        
+        DBMS_OUTPUT.PUT_LINE('✓ Source tablespace found: ' || v_source_tablespace);
+        DBMS_OUTPUT.PUT_LINE('  Type: ' || CASE WHEN v_bigfile = 'YES' THEN 'BIGFILE' ELSE 'SMALLFILE' END);
+        DBMS_OUTPUT.PUT_LINE('  Block Size: ' || v_block_size || ' bytes');
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            DBMS_OUTPUT.PUT_LINE('✗ ERROR: Source tablespace ' || v_source_tablespace || ' not found!');
+            RETURN;
+    END;
+    
+    -- ============================================================================
+    -- 2. Calculate source tablespace size and usage
+    -- ============================================================================
+    DECLARE
+        v_source_hwm_mb NUMBER;
+    BEGIN
+        -- Get current allocated size
+        SELECT CEIL(SUM(bytes)/1024/1024)
+        INTO v_source_size_mb
+        FROM dba_data_files
+        WHERE tablespace_name = v_source_tablespace;
+        
+        -- Get ACTUAL used space (sum of all segments)
+        SELECT CEIL(NVL(SUM(bytes), 0)/1024/1024)
+        INTO v_source_used_mb
+        FROM dba_segments
+        WHERE tablespace_name = v_source_tablespace;
+        
+        -- Get HWM (highest extent position) for reference
+        SELECT CEIL(SUM(NVL(hwm.hwm_bytes, df.bytes))/1024/1024)
+        INTO v_source_hwm_mb
+        FROM dba_data_files df
+        LEFT JOIN 
+            (SELECT 
+                 file_id, 
+                 MAX(block_id + blocks - 1) * 
+                 (SELECT TO_NUMBER(value) FROM v$parameter WHERE name = 'db_block_size') AS hwm_bytes
+             FROM dba_extents
+             WHERE tablespace_name = v_source_tablespace
+             GROUP BY file_id) hwm
+        ON df.file_id = hwm.file_id
+        WHERE df.tablespace_name = v_source_tablespace;
+        
+        DBMS_OUTPUT.PUT_LINE('');
+        DBMS_OUTPUT.PUT_LINE('Source Tablespace Analysis:');
+        DBMS_OUTPUT.PUT_LINE('  Allocated Size: ' || v_source_size_mb || ' MB (' || ROUND(v_source_size_mb/1024, 2) || ' GB)');
+        DBMS_OUTPUT.PUT_LINE('  Used Space:     ' || v_source_used_mb || ' MB (' || ROUND(v_source_used_mb/1024, 2) || ' GB)');
+        DBMS_OUTPUT.PUT_LINE('  High Water Mark:' || v_source_hwm_mb || ' MB (' || ROUND(v_source_hwm_mb/1024, 2) || ' GB)');
+        DBMS_OUTPUT.PUT_LINE('  Wasted Space:   ' || (v_source_size_mb - v_source_used_mb) || ' MB (' || 
+                             ROUND((v_source_size_mb - v_source_used_mb)/1024, 2) || ' GB)');
+        DBMS_OUTPUT.PUT_LINE('  Efficiency:     ' || ROUND((v_source_used_mb / v_source_size_mb) * 100, 2) || '%');
+    END;
+    
+    -- ============================================================================
+    -- 3. Generate shrink tablespace name
+    -- ============================================================================
+    v_shrink_tablespace := v_source_tablespace || '_SHRINK';
+    v_shrink_size_mb := v_source_used_mb + v_buffer_mb;
+    
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('Shrink Tablespace Plan:');
+    DBMS_OUTPUT.PUT_LINE('  Name: ' || v_shrink_tablespace);
+    DBMS_OUTPUT.PUT_LINE('  Size: ' || v_shrink_size_mb || ' MB (' || ROUND(v_shrink_size_mb/1024, 2) || ' GB)');
+    DBMS_OUTPUT.PUT_LINE('  Formula: Used (' || v_source_used_mb || ' MB) + Buffer (' || v_buffer_mb || ' MB)');
+    
+    -- ============================================================================
+    -- 4. Check if shrink tablespace already exists
+    -- ============================================================================
+    SELECT COUNT(*)
+    INTO v_shrink_exists
+    FROM dba_tablespaces
+    WHERE tablespace_name = v_shrink_tablespace;
+    
+    IF v_shrink_exists > 0 THEN
+        DBMS_OUTPUT.PUT_LINE('');
+        DBMS_OUTPUT.PUT_LINE('✗ ERROR: Shrink tablespace ' || v_shrink_tablespace || ' already exists!');
+        DBMS_OUTPUT.PUT_LINE('  Please drop it first:');
+        DBMS_OUTPUT.PUT_LINE('  DROP TABLESPACE ' || v_shrink_tablespace || ' INCLUDING CONTENTS AND DATAFILES;');
+        RETURN;
+    END IF;
+    
+    -- ============================================================================
+    -- 5. Analyze LOB/LONG tables
+    -- ============================================================================
+    DECLARE
+        v_lob_count NUMBER := 0;
+        v_long_count NUMBER := 0;
+        v_lob_size_mb NUMBER := 0;
+    BEGIN
+        -- Count LOB tables
+        SELECT COUNT(DISTINCT l.table_name)
+        INTO v_lob_count
+        FROM dba_lobs l
+        JOIN dba_tables t ON l.owner = t.owner AND l.table_name = t.table_name
+        WHERE t.tablespace_name = v_source_tablespace;
+        
+        -- Count LONG tables
+        SELECT COUNT(DISTINCT c.table_name)
+        INTO v_long_count
+        FROM dba_tab_columns c
+        JOIN dba_tables t ON c.owner = t.owner AND c.table_name = t.table_name
+        WHERE t.tablespace_name = v_source_tablespace
+        AND c.data_type IN ('LONG', 'LONG RAW');
+        
+        -- Calculate total LOB size (including LOB segments)
+        SELECT CEIL(NVL(SUM(s.bytes), 0)/1024/1024)
+        INTO v_lob_size_mb
+        FROM dba_segments s
+        WHERE s.tablespace_name = v_source_tablespace
+        AND (s.segment_type LIKE '%LOB%' OR s.segment_name LIKE 'SYS_LOB%');
+        
+        v_total_lob_tables := v_lob_count;
+        
+        DBMS_OUTPUT.PUT_LINE('');
+        DBMS_OUTPUT.PUT_LINE('LOB/LONG Analysis:');
+        DBMS_OUTPUT.PUT_LINE('  LOB Tables:  ' || v_lob_count);
+        DBMS_OUTPUT.PUT_LINE('  LONG Tables: ' || v_long_count);
+        DBMS_OUTPUT.PUT_LINE('  Total LOB Data: ' || v_lob_size_mb || ' MB (' || ROUND(v_lob_size_mb/1024, 2) || ' GB)');
+        
+        IF v_long_count > 0 THEN
+            DBMS_OUTPUT.PUT_LINE('');
+            DBMS_OUTPUT.PUT_LINE('⚠️  WARNING: Tables with LONG/LONG RAW columns will be SKIPPED');
+            DBMS_OUTPUT.PUT_LINE('   LONG columns cannot be moved with ALTER TABLE MOVE');
+            DBMS_OUTPUT.PUT_LINE('');
+            
+            -- Show LONG tables
+            DBMS_OUTPUT.PUT_LINE('Tables with LONG columns (will be skipped):');
+            FOR long_rec IN (
+                SELECT DISTINCT c.owner, c.table_name, c.column_name, c.data_type
+                FROM dba_tab_columns c
+                JOIN dba_tables t ON c.owner = t.owner AND c.table_name = t.table_name
+                WHERE t.tablespace_name = v_source_tablespace
+                AND c.data_type IN ('LONG', 'LONG RAW')
+                ORDER BY c.owner, c.table_name
+            ) LOOP
+                DBMS_OUTPUT.PUT_LINE('  - ' || long_rec.owner || '.' || long_rec.table_name || 
+                                   ' (' || long_rec.column_name || ' ' || long_rec.data_type || ')');
+            END LOOP;
+        END IF;
+        
+        IF v_lob_count > 0 THEN
+            DBMS_OUTPUT.PUT_LINE('');
+            DBMS_OUTPUT.PUT_LINE('LOB Tables (will be moved with special handling):');
+            FOR lob_rec IN (
+                SELECT DISTINCT 
+                    l.owner,
+                    l.table_name,
+                    COUNT(*) AS lob_col_count,
+                    LISTAGG(l.column_name, ', ') WITHIN GROUP (ORDER BY l.column_name) AS lob_columns,
+                    MAX(l.securefile) AS securefile_type
+                FROM dba_lobs l
+                JOIN dba_tables t ON l.owner = t.owner AND l.table_name = t.table_name
+                WHERE t.tablespace_name = v_source_tablespace
+                GROUP BY l.owner, l.table_name
+                ORDER BY l.owner, l.table_name
+                FETCH FIRST 20 ROWS ONLY
+            ) LOOP
+                DBMS_OUTPUT.PUT_LINE('  - ' || lob_rec.owner || '.' || lob_rec.table_name);
+                DBMS_OUTPUT.PUT_LINE('    LOB Columns: ' || lob_rec.lob_columns);
+                DBMS_OUTPUT.PUT_LINE('    Type: ' || CASE WHEN lob_rec.securefile_type = 'YES' THEN 'SECUREFILE' ELSE 'BASICFILE' END);
+            END LOOP;
+            
+            IF v_lob_count > 20 THEN
+                DBMS_OUTPUT.PUT_LINE('  ... and ' || (v_lob_count - 20) || ' more LOB tables');
+            END IF;
+        END IF;
+    END;
+    
+    -- ============================================================================
+    -- 6. Analyze partitioned objects
+    -- ============================================================================
+    DECLARE
+        v_table_partitions NUMBER := 0;
+        v_index_partitions NUMBER := 0;
+        v_lob_partitions NUMBER := 0;
+        v_total_partitions NUMBER := 0;
+    BEGIN
+        -- Count table partitions
+        SELECT COUNT(DISTINCT table_owner || '.' || table_name || '.' || partition_name)
+        INTO v_table_partitions
+        FROM dba_tab_partitions
+        WHERE tablespace_name = v_source_tablespace;
+        
+        -- Count index partitions
+        SELECT COUNT(DISTINCT index_owner || '.' || index_name || '.' || partition_name)
+        INTO v_index_partitions
+        FROM dba_ind_partitions
+        WHERE tablespace_name = v_source_tablespace;
+        
+        -- Count LOB partitions
+        SELECT COUNT(*)
+        INTO v_lob_partitions
+        FROM dba_lob_partitions
+        WHERE tablespace_name = v_source_tablespace;
+        
+        v_total_partitions := v_table_partitions + v_index_partitions + v_lob_partitions;
+        
+        IF v_total_partitions > 0 THEN
+            DBMS_OUTPUT.PUT_LINE('');
+            DBMS_OUTPUT.PUT_LINE('Partitioned Objects Found:');
+            DBMS_OUTPUT.PUT_LINE('  Table Partitions: ' || v_table_partitions);
+            DBMS_OUTPUT.PUT_LINE('  Index Partitions: ' || v_index_partitions);
+            DBMS_OUTPUT.PUT_LINE('  LOB Partitions:   ' || v_lob_partitions);
+            DBMS_OUTPUT.PUT_LINE('  Total:            ' || v_total_partitions);
+            
+            IF v_lob_partitions > 0 THEN
+                DBMS_OUTPUT.PUT_LINE('');
+                DBMS_OUTPUT.PUT_LINE('⚠️  WARNING: LOB partitions require special handling');
+                DBMS_OUTPUT.PUT_LINE('');
+                
+                -- CRITICAL FIX #2: Corrected JOIN with proper columns
+                DBMS_OUTPUT.PUT_LINE('LOB Partitions (sample):');
+                FOR lob_part IN (
+                    SELECT lp.table_owner, lp.table_name, lp.lob_name, 
+                           lp.partition_name, lp.lob_partition_name,
+                           ROUND(s.bytes/1024/1024, 2) AS size_mb
+                    FROM dba_lob_partitions lp
+                    LEFT JOIN dba_segments s 
+                        ON lp.table_owner = s.owner 
+                        AND lp.lob_partition_name = s.segment_name
+                        AND lp.tablespace_name = s.tablespace_name
+                    WHERE lp.tablespace_name = v_source_tablespace
+                    ORDER BY lp.table_owner, lp.table_name, lp.partition_name
+                    FETCH FIRST 10 ROWS ONLY
+                ) LOOP
+                    DBMS_OUTPUT.PUT_LINE('  - ' || lob_part.table_owner || '.' || 
+                                         lob_part.table_name || '.' || lob_part.partition_name ||
+                                         ' (LOB: ' || lob_part.lob_name || ', ' || 
+                                         NVL(TO_CHAR(lob_part.size_mb), '0') || ' MB)');
+                END LOOP;
+                
+                IF v_lob_partitions > 10 THEN
+                    DBMS_OUTPUT.PUT_LINE('  ... and ' || (v_lob_partitions - 10) || ' more');
+                END IF;
+            END IF;
+            
+            DBMS_OUTPUT.PUT_LINE('');
+            DBMS_OUTPUT.PUT_LINE('✓ Partitions will be moved individually');
+        ELSE
+            DBMS_OUTPUT.PUT_LINE('');
+            DBMS_OUTPUT.PUT_LINE('✓ No partitioned objects found');
+        END IF;
+    END;
+    
+    -- ============================================================================
+    -- 7. Count objects to process
+    -- ============================================================================
+    
+    -- Count tables WITHOUT LOB/LONG
+    SELECT COUNT(DISTINCT table_name)
+    INTO v_total_tables
+    FROM dba_tables
+    WHERE tablespace_name = v_source_tablespace
+    AND NOT EXISTS (
+        SELECT 1 FROM dba_lobs l 
+        WHERE l.owner = dba_tables.owner 
+        AND l.table_name = dba_tables.table_name
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM dba_tab_columns c
+        WHERE c.owner = dba_tables.owner 
+        AND c.table_name = dba_tables.table_name
+        AND c.data_type IN ('LONG', 'LONG RAW')
+    );
+    
+    -- Count indexes
+    SELECT COUNT(DISTINCT index_name)
+    INTO v_total_indexes
+    FROM dba_indexes
+    WHERE tablespace_name = v_source_tablespace;
+    
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('Objects to process:');
+    DBMS_OUTPUT.PUT_LINE('  Tables (without LOB/LONG):  ' || v_total_tables);
+    DBMS_OUTPUT.PUT_LINE('  Tables (with LOB):           ' || v_total_lob_tables);
+    DBMS_OUTPUT.PUT_LINE('  Indexes:                     ' || v_total_indexes);
+    DBMS_OUTPUT.PUT_LINE('  Total to move:               ' || (v_total_tables + v_total_lob_tables + v_total_indexes));
+    
+    -- ============================================================================
+    -- 8. Resource checks (UNDO and TEMP space)
+    -- ============================================================================
+    BEGIN
+        -- Get UNDO tablespace name
+        SELECT value INTO v_undo_tablespace
+        FROM v$parameter WHERE name = 'undo_tablespace';
+        
+        -- Calculate required UNDO (estimate 50% of LOB size)
+        SELECT ROUND(NVL(SUM(bytes), 0)/1024/1024/1024 * 0.5, 2)
+        INTO v_required_undo_gb
+        FROM dba_segments
+        WHERE tablespace_name = v_source_tablespace
+        AND segment_type LIKE '%LOB%';
+        
+        -- Check available UNDO
+        SELECT ROUND(NVL(SUM(bytes), 0)/1024/1024/1024, 2)
+        INTO v_available_undo_gb
+        FROM dba_free_space
+        WHERE tablespace_name = v_undo_tablespace;
+        
+        DBMS_OUTPUT.PUT_LINE('');
+        DBMS_OUTPUT.PUT_LINE('Resource Check:');
+        DBMS_OUTPUT.PUT_LINE('  UNDO Tablespace:     ' || v_undo_tablespace);
+        DBMS_OUTPUT.PUT_LINE('  Required UNDO (est): ' || v_required_undo_gb || ' GB');
+        DBMS_OUTPUT.PUT_LINE('  Available UNDO:      ' || v_available_undo_gb || ' GB');
+        
+        IF v_available_undo_gb < v_required_undo_gb THEN
+            DBMS_OUTPUT.PUT_LINE('  Status: ⚠️  WARNING - Low UNDO space');
+            DBMS_OUTPUT.PUT_LINE('          Consider increasing UNDO tablespace or reducing batch size');
+        ELSE
+            DBMS_OUTPUT.PUT_LINE('  Status: ✓ Sufficient UNDO space');
+        END IF;
+    EXCEPTION
+        WHEN OTHERS THEN
+            DBMS_OUTPUT.PUT_LINE('  ⚠️  Could not verify UNDO space: ' || SQLERRM);
+    END;
+    
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('✓ Pre-flight checks completed');
+    v_phase_duration := EXTRACT(SECOND FROM (SYSTIMESTAMP - v_phase_start_time));
+    DBMS_OUTPUT.PUT_LINE('  Duration: ' || ROUND(v_phase_duration, 2) || ' seconds');
+    
+    IF v_dry_run = 'Y' THEN
+        DBMS_OUTPUT.PUT_LINE('');
+        DBMS_OUTPUT.PUT_LINE('==================== DRY RUN MODE ====================');
+        DBMS_OUTPUT.PUT_LINE('No changes will be made. Showing planned operations only.');
+        DBMS_OUTPUT.PUT_LINE('======================================================');
+    END IF;
+    
+    -- ============================================================================
+    -- PHASE 2: CREATE SHRINK TABLESPACE
+    -- ============================================================================
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('================================================================================');
+    DBMS_OUTPUT.PUT_LINE('PHASE 2: CREATE SHRINK TABLESPACE');
+    DBMS_OUTPUT.PUT_LINE('================================================================================');
+    v_phase_start_time := SYSTIMESTAMP;
+    
+    v_sql := 'CREATE ' || 
+             CASE WHEN v_bigfile = 'YES' THEN 'BIGFILE' ELSE 'SMALLFILE' END || 
+             ' TABLESPACE ' || v_shrink_tablespace || 
+             ' DATAFILE SIZE ' || v_shrink_size_mb || 'M AUTOEXTEND ON';
+    
+    DBMS_OUTPUT.PUT_LINE('Command: ' || v_sql);
+    
+    IF v_dry_run = 'Y' THEN
+        DBMS_OUTPUT.PUT_LINE('[DRY RUN - Not executed]');
+    ELSE
+        EXECUTE IMMEDIATE v_sql;
+        DBMS_OUTPUT.PUT_LINE('✓ Shrink tablespace created successfully');
+    END IF;
+    
+    v_phase_duration := EXTRACT(SECOND FROM (SYSTIMESTAMP - v_phase_start_time));
+    DBMS_OUTPUT.PUT_LINE('Phase 2 Duration: ' || ROUND(v_phase_duration, 2) || ' seconds');
+    
+    -- ============================================================================
+    -- PHASE 3: MOVE OBJECTS TO SHRINK TABLESPACE
+    -- ============================================================================
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('================================================================================');
+    DBMS_OUTPUT.PUT_LINE('PHASE 3: MOVE OBJECTS TO SHRINK TABLESPACE');
+    DBMS_OUTPUT.PUT_LINE('================================================================================');
+    v_phase_start_time := SYSTIMESTAMP;
+    
+    -- ============================================================================
+    -- 3A. Move standard tables (without LOB/LONG)
+    -- ============================================================================
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('--- Moving Standard Tables (without LOB) ---');
+    
+    DECLARE
+        v_batch NUMBER := 0;
+        v_batch_count NUMBER := 0;
+        v_skipped NUMBER := 0;
+    BEGIN
+        FOR tbl IN (
+            SELECT t.owner, t.table_name
+            FROM dba_tables t
+            WHERE t.tablespace_name = v_source_tablespace
+            AND NOT EXISTS (
+                SELECT 1 FROM dba_lobs l 
+                WHERE l.owner = t.owner AND l.table_name = t.table_name
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM dba_tab_columns c 
+                WHERE c.owner = t.owner AND c.table_name = t.table_name 
+                AND c.data_type IN ('LONG', 'LONG RAW')
+            )
+            ORDER BY t.owner, t.table_name
+        ) LOOP
+            v_batch_count := v_batch_count + 1;
+            
+            IF MOD(v_batch_count - 1, v_objects_per_batch) = 0 THEN
+                v_batch := v_batch + 1;
+                DBMS_OUTPUT.PUT_LINE('');
+                DBMS_OUTPUT.PUT_LINE('Batch ' || v_batch || ':');
+            END IF;
+            
+            v_sql := 'ALTER TABLE ' || tbl.owner || '.' || tbl.table_name || 
+                     ' MOVE TABLESPACE ' || v_shrink_tablespace;
+            
+            -- Set progress tracking
+            DBMS_APPLICATION_INFO.SET_MODULE(
+                module_name => 'DEFRAG_V3',
+                action_name => 'Moving Table: ' || tbl.owner || '.' || tbl.table_name
+            );
+            
+            DBMS_OUTPUT.PUT_LINE('  [' || v_batch_count || '/' || v_total_tables || '] ' || 
+                                 tbl.owner || '.' || tbl.table_name);
+            
+            IF v_dry_run = 'Y' THEN
+                DBMS_OUTPUT.PUT_LINE('      Command: ' || v_sql);
+                DBMS_OUTPUT.PUT_LINE('      [DRY RUN - Not executed]');
+            ELSE
+                DBMS_OUTPUT.PUT_LINE('      Executing...');
+                BEGIN
+                    EXECUTE IMMEDIATE v_sql;
+                    DBMS_OUTPUT.PUT_LINE('      ✓ Moved successfully');
+                    v_tables_moved := v_tables_moved + 1;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        DBMS_OUTPUT.PUT_LINE('      ✗ Failed: ' || SQLERRM);
+                END;
+            END IF;
+        END LOOP;
+    END;
+    
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('Standard tables moved: ' || v_tables_moved || ' / ' || v_total_tables);
+    
+    -- ============================================================================
+    -- 3B. Move LOB tables with LOB clause
+    -- ============================================================================
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('--- Moving LOB Tables (with LOB storage clauses) ---');
+    
+    DECLARE
+        v_batch NUMBER := 0;
+        v_batch_count NUMBER := 0;
+        v_lob_clause VARCHAR2(4000);
+        v_table_size_mb NUMBER;
+    BEGIN
+        FOR tbl IN (
+            SELECT DISTINCT t.owner, t.table_name
+            FROM dba_tables t
+            WHERE t.tablespace_name = v_source_tablespace
+            AND EXISTS (
+                SELECT 1 FROM dba_lobs l 
+                WHERE l.owner = t.owner AND l.table_name = t.table_name
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM dba_tab_columns c 
+                WHERE c.owner = t.owner AND c.table_name = t.table_name 
+                AND c.data_type IN ('LONG', 'LONG RAW')
+            )
+            ORDER BY t.owner, t.table_name
+        ) LOOP
+            v_batch_count := v_batch_count + 1;
+            
+            IF MOD(v_batch_count - 1, v_lob_objects_per_batch) = 0 THEN
+                v_batch := v_batch + 1;
+                DBMS_OUTPUT.PUT_LINE('');
+                DBMS_OUTPUT.PUT_LINE('LOB Batch ' || v_batch || ':');
+            END IF;
+            
+            -- Calculate table size
+            BEGIN
+                SELECT ROUND(NVL(SUM(bytes), 0)/1024/1024, 2)
+                INTO v_table_size_mb
+                FROM dba_segments
+                WHERE owner = tbl.owner 
+                AND segment_name = tbl.table_name;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    v_table_size_mb := 0;
+            END;
+            
+            -- Build LOB clause for all LOB columns
+            v_lob_clause := '';
+            FOR lob_rec IN (
+                SELECT column_name, securefile, chunk, pctversion, cache, logging
+                FROM dba_lobs
+                WHERE owner = tbl.owner
+                AND table_name = tbl.table_name
+            ) LOOP
+                v_lob_clause := v_lob_clause || 
+                    ' LOB (' || lob_rec.column_name || ') STORE AS ' ||
+                    CASE WHEN lob_rec.securefile = 'YES' THEN 'SECUREFILE' ELSE 'BASICFILE' END ||
+                    ' (TABLESPACE ' || v_shrink_tablespace || ')';
+            END LOOP;
+            
+            v_sql := 'ALTER TABLE ' || tbl.owner || '.' || tbl.table_name || 
+                     ' MOVE TABLESPACE ' || v_shrink_tablespace ||
+                     v_lob_clause;
+            
+            -- Set progress tracking
+            DBMS_APPLICATION_INFO.SET_MODULE(
+                module_name => 'DEFRAG_V3',
+                action_name => 'Moving LOB Table: ' || tbl.owner || '.' || tbl.table_name
+            );
+            
+            DBMS_OUTPUT.PUT_LINE('  [' || v_batch_count || '/' || v_total_lob_tables || '] ' || 
+                                 tbl.owner || '.' || tbl.table_name || 
+                                 ' (' || v_table_size_mb || ' MB)');
+            
+            IF v_dry_run = 'Y' THEN
+                DBMS_OUTPUT.PUT_LINE('      Command: ' || SUBSTR(v_sql, 1, 200) || '...');
+                DBMS_OUTPUT.PUT_LINE('      [DRY RUN - Not executed]');
+            ELSE
+                DBMS_OUTPUT.PUT_LINE('      Executing (this may take time for large LOBs)...');
+                BEGIN
+                    EXECUTE IMMEDIATE v_sql;
+                    DBMS_OUTPUT.PUT_LINE('      ✓ Moved successfully (table + LOB segments)');
+                    v_lob_tables_moved := v_lob_tables_moved + 1;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        DBMS_OUTPUT.PUT_LINE('      ✗ Failed: ' || SQLERRM);
+                END;
+            END IF;
+        END LOOP;
+    END;
+    
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('LOB tables moved: ' || v_lob_tables_moved || ' / ' || v_total_lob_tables);
+    
+    -- ============================================================================
+    -- 3C. Move table partitions
+    -- ============================================================================
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('--- Moving Table Partitions ---');
+    
+    DECLARE
+        v_batch NUMBER := 0;
+        v_batch_count NUMBER := 0;
+        v_partitions_moved NUMBER := 0;
+        -- CRITICAL FIX #3: Store loop variables
+        v_last_owner VARCHAR2(128);
+        v_last_table VARCHAR2(128);
+        v_last_partition VARCHAR2(128);
+    BEGIN
+        FOR part_rec IN (
+            SELECT table_owner, table_name, partition_name
+            FROM dba_tab_partitions
+            WHERE tablespace_name = v_source_tablespace
+            ORDER BY table_owner, table_name, partition_position
+        ) LOOP
+            -- CRITICAL FIX #3: Copy values inside loop
+            v_last_owner := part_rec.table_owner;
+            v_last_table := part_rec.table_name;
+            v_last_partition := part_rec.partition_name;
+            
+            v_batch_count := v_batch_count + 1;
+            
+            IF MOD(v_batch_count - 1, v_objects_per_batch) = 0 THEN
+                v_batch := v_batch + 1;
+                DBMS_OUTPUT.PUT_LINE('');
+                DBMS_OUTPUT.PUT_LINE('Partition Batch ' || v_batch || ':');
+            END IF;
+            
+            v_sql := 'ALTER TABLE ' || part_rec.table_owner || '.' || part_rec.table_name || 
+                     ' MOVE PARTITION ' || part_rec.partition_name ||
+                     ' TABLESPACE ' || v_shrink_tablespace || ' ONLINE';
+            
+            DBMS_APPLICATION_INFO.SET_MODULE(
+                module_name => 'DEFRAG_V3',
+                action_name => 'Moving Partition: ' || part_rec.table_owner || '.' || 
+                              part_rec.table_name || '.' || part_rec.partition_name
+            );
+            
+            DBMS_OUTPUT.PUT_LINE('  [' || v_batch_count || '] ' || 
+                                 part_rec.table_owner || '.' || part_rec.table_name || 
+                                 '.' || part_rec.partition_name);
+            
+            IF v_dry_run = 'Y' THEN
+                DBMS_OUTPUT.PUT_LINE('      Command: ' || v_sql);
+                DBMS_OUTPUT.PUT_LINE('      [DRY RUN - Not executed]');
+            ELSE
+                BEGIN
+                    EXECUTE IMMEDIATE v_sql;
+                    DBMS_OUTPUT.PUT_LINE('      ✓ Moved successfully');
+                    v_partitions_moved := v_partitions_moved + 1;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        DBMS_OUTPUT.PUT_LINE('      ✗ Failed: ' || SQLERRM);
+                END;
+            END IF;
+        END LOOP;
+        
+        -- Use saved variables outside loop
+        IF v_batch_count > 0 THEN
+            DBMS_OUTPUT.PUT_LINE('');
+            DBMS_OUTPUT.PUT_LINE('Last partition processed: ' || v_last_owner || '.' || 
+                                v_last_table || '.' || v_last_partition);
+        END IF;
+        
+        DBMS_OUTPUT.PUT_LINE('');
+        DBMS_OUTPUT.PUT_LINE('Table partitions moved: ' || v_partitions_moved);
+    END;
+    
+    -- ============================================================================
+    -- 3D. Rebuild indexes
+    -- ============================================================================
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('--- Rebuilding Indexes ---');
+    
+    DECLARE
+        v_batch NUMBER := 0;
+        v_batch_count NUMBER := 0;
+    BEGIN
+        FOR idx IN (
+            SELECT i.owner, i.index_name, i.index_type
+            FROM dba_indexes i
+            WHERE i.tablespace_name = v_source_tablespace
+            ORDER BY i.owner, i.index_name
+        ) LOOP
+            v_batch_count := v_batch_count + 1;
+            
+            IF MOD(v_batch_count - 1, v_objects_per_batch) = 0 THEN
+                v_batch := v_batch + 1;
+                DBMS_OUTPUT.PUT_LINE('');
+                DBMS_OUTPUT.PUT_LINE('Index Batch ' || v_batch || ':');
+            END IF;
+            
+            -- Skip problematic index types
+            IF idx.index_type IN ('DOMAIN', 'LOB', 'CLUSTER') THEN
+                DBMS_OUTPUT.PUT_LINE('  [' || v_batch_count || '/' || v_total_indexes || '] ' || 
+                                     idx.owner || '.' || idx.index_name || ' (' || idx.index_type || ')');
+                DBMS_OUTPUT.PUT_LINE('      ⊘ Skipped (unsupported index type)');
+                CONTINUE;
+            END IF;
+            
+            v_sql := 'ALTER INDEX ' || idx.owner || '.' || idx.index_name || 
+                     ' REBUILD TABLESPACE ' || v_shrink_tablespace || ' ONLINE';
+            
+            DBMS_APPLICATION_INFO.SET_MODULE(
+                module_name => 'DEFRAG_V3',
+                action_name => 'Rebuilding Index: ' || idx.owner || '.' || idx.index_name
+            );
+            
+            DBMS_OUTPUT.PUT_LINE('  [' || v_batch_count || '/' || v_total_indexes || '] ' || 
+                                 idx.owner || '.' || idx.index_name);
+            
+            IF v_dry_run = 'Y' THEN
+                DBMS_OUTPUT.PUT_LINE('      Command: ' || v_sql);
+                DBMS_OUTPUT.PUT_LINE('      [DRY RUN - Not executed]');
+            ELSE
+                BEGIN
+                    EXECUTE IMMEDIATE v_sql;
+                    DBMS_OUTPUT.PUT_LINE('      ✓ Rebuilt successfully');
+                    v_indexes_moved := v_indexes_moved + 1;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        DBMS_OUTPUT.PUT_LINE('      ✗ Failed: ' || SQLERRM);
+                END;
+            END IF;
+        END LOOP;
+    END;
+    
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('Indexes rebuilt: ' || v_indexes_moved || ' / ' || v_total_indexes);
+    
+    -- ============================================================================
+    -- 3E. Rebuild index partitions
+    -- ============================================================================
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('--- Rebuilding Index Partitions ---');
+    
+    DECLARE
+        v_batch NUMBER := 0;
+        v_batch_count NUMBER := 0;
+        v_idx_partitions_moved NUMBER := 0;
+    BEGIN
+        FOR ipart IN (
+            SELECT index_owner, index_name, partition_name
+            FROM dba_ind_partitions
+            WHERE tablespace_name = v_source_tablespace
+            ORDER BY index_owner, index_name, partition_position
+        ) LOOP
+            v_batch_count := v_batch_count + 1;
+            
+            IF MOD(v_batch_count - 1, v_objects_per_batch) = 0 THEN
+                v_batch := v_batch + 1;
+                DBMS_OUTPUT.PUT_LINE('');
+                DBMS_OUTPUT.PUT_LINE('Index Partition Batch ' || v_batch || ':');
+            END IF;
+            
+            v_sql := 'ALTER INDEX ' || ipart.index_owner || '.' || ipart.index_name || 
+                     ' REBUILD PARTITION ' || ipart.partition_name ||
+                     ' TABLESPACE ' || v_shrink_tablespace || ' ONLINE';
+            
+            DBMS_OUTPUT.PUT_LINE('  [' || v_batch_count || '] ' || 
+                                 ipart.index_owner || '.' || ipart.index_name || 
+                                 '.' || ipart.partition_name);
+            
+            IF v_dry_run = 'Y' THEN
+                DBMS_OUTPUT.PUT_LINE('      Command: ' || v_sql);
+                DBMS_OUTPUT.PUT_LINE('      [DRY RUN - Not executed]');
+            ELSE
+                BEGIN
+                    EXECUTE IMMEDIATE v_sql;
+                    DBMS_OUTPUT.PUT_LINE('      ✓ Rebuilt successfully');
+                    v_idx_partitions_moved := v_idx_partitions_moved + 1;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        DBMS_OUTPUT.PUT_LINE('      ✗ Failed: ' || SQLERRM);
+                END;
+            END IF;
+        END LOOP;
+        
+        DBMS_OUTPUT.PUT_LINE('');
+        DBMS_OUTPUT.PUT_LINE('Index partitions rebuilt: ' || v_idx_partitions_moved);
+    END;
+    
+    v_phase_duration := EXTRACT(SECOND FROM (SYSTIMESTAMP - v_phase_start_time));
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('Phase 3 Duration: ' || ROUND(v_phase_duration, 2) || ' seconds');
+    
+    -- ============================================================================
+    -- PHASE 4: VERIFICATION AND SUMMARY
+    -- ============================================================================
+    DBMS_OUTPUT.PUT_LINE('');
+    DBMS_OUTPUT.PUT_LINE('================================================================================');
+    DBMS_OUTPUT.PUT_LINE('PHASE 4: VERIFICATION AND SUMMARY');
+    DBMS_OUTPUT.PUT_LINE('================================================================================');
+    
+    IF v_dry_run = 'N' THEN
+        -- Verify no objects left in source
+        DECLARE
+            v_remaining_objects NUMBER;
+        BEGIN
+            SELECT COUNT(*)
+            INTO v_remaining_objects
+            FROM dba_segments
+            WHERE tablespace_name = v_source_tablespace
+            AND segment_type NOT LIKE '%LOB%'
+            AND segment_name NOT LIKE 'SYS_LOB%';
+            
+            DBMS_OUTPUT.PUT_LINE('Remaining objects in source: ' || v_remaining_objects);
+            
+            IF v_remaining_objects > 0 THEN
+                DBMS_OUTPUT.PUT_LINE('⚠️  WARNING: Some objects remain in source tablespace');
+                DBMS_OUTPUT.PUT_LINE('   (May include LOB/LONG tables that were skipped)');
+            ELSE
+                DBMS_OUTPUT.PUT_LINE('✓ All moveable objects successfully relocated');
+            END IF;
+        END;
+    END IF;
+    
+    -- Summary
+    DECLARE
+        v_total_duration NUMBER;
+    BEGIN
+        v_total_duration := EXTRACT(SECOND FROM (SYSTIMESTAMP - v_script_start_time));
+        
+        DBMS_OUTPUT.PUT_LINE('');
+        DBMS_OUTPUT.PUT_LINE('================================================================================');
+        DBMS_OUTPUT.PUT_LINE('EXECUTION SUMMARY');
+        DBMS_OUTPUT.PUT_LINE('================================================================================');
+        DBMS_OUTPUT.PUT_LINE('Mode:                    ' || CASE WHEN v_dry_run = 'Y' THEN 'DRY RUN' ELSE 'ACTUAL EXECUTION' END);
+        DBMS_OUTPUT.PUT_LINE('Standard Tables Moved:   ' || v_tables_moved || ' / ' || v_total_tables);
+        DBMS_OUTPUT.PUT_LINE('LOB Tables Moved:        ' || v_lob_tables_moved || ' / ' || v_total_lob_tables);
+        DBMS_OUTPUT.PUT_LINE('Indexes Rebuilt:         ' || v_indexes_moved || ' / ' || v_total_indexes);
+        DBMS_OUTPUT.PUT_LINE('Total Duration:          ' || ROUND(v_total_duration, 2) || ' seconds');
+        DBMS_OUTPUT.PUT_LINE('================================================================================');
+        
+        IF v_dry_run = 'Y' THEN
+            DBMS_OUTPUT.PUT_LINE('');
+            DBMS_OUTPUT.PUT_LINE('✓ DRY RUN COMPLETED SUCCESSFULLY');
+            DBMS_OUTPUT.PUT_LINE('  To execute for real, re-run with Dry Run Mode = N');
+        ELSE
+            DBMS_OUTPUT.PUT_LINE('');
+            DBMS_OUTPUT.PUT_LINE('✓ MIGRATION COMPLETED');
+            DBMS_OUTPUT.PUT_LINE('');
+            DBMS_OUTPUT.PUT_LINE('Next Steps:');
+            DBMS_OUTPUT.PUT_LINE('1. Verify application functionality');
+            DBMS_OUTPUT.PUT_LINE('2. Monitor performance');
+            DBMS_OUTPUT.PUT_LINE('3. If satisfied, consider dropping source tablespace');
+            DBMS_OUTPUT.PUT_LINE('   DROP TABLESPACE ' || v_source_tablespace || ' INCLUDING CONTENTS AND DATAFILES;');
+        END IF;
+    END;
+    
+    -- Clear progress tracking
+    DBMS_APPLICATION_INFO.SET_MODULE(module_name => NULL, action_name => NULL);
+    
+EXCEPTION
+    WHEN OTHERS THEN
+        DBMS_OUTPUT.PUT_LINE('');
+        DBMS_OUTPUT.PUT_LINE('================================================================================');
+        DBMS_OUTPUT.PUT_LINE('✗ CRITICAL ERROR');
+        DBMS_OUTPUT.PUT_LINE('================================================================================');
+        DBMS_OUTPUT.PUT_LINE('Error: ' || SQLERRM);
+        DBMS_OUTPUT.PUT_LINE('Error Code: ' || SQLCODE);
+        DBMS_OUTPUT.PUT_LINE('');
+        DBMS_OUTPUT.PUT_LINE('Script terminated. Please review the error and retry.');
+        
+        -- Clear progress tracking
+        DBMS_APPLICATION_INFO.SET_MODULE(module_name => NULL, action_name => NULL);
+        
+        RAISE;
+END;
+/
+
+PROMPT
+PROMPT ================================================================================
+PROMPT Script Part 1 execution finished.
+PROMPT ================================================================================
+
+-- Restore SQL*Plus settings
+SET DEFINE ON
+SET FEEDBACK ON
